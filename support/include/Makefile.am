@@ -15,6 +15,7 @@ noinst_HEADERS = \
 	nfsrpc.h \
 	nls.h \
 	nsm.h \
+	passwd_query.h \
 	pseudoflavors.h \
 	rpcmisc.h \
 	sockaddr.h \

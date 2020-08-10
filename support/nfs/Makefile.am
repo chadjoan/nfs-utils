@@ -10,7 +10,7 @@ libnfs_la_SOURCES = exports.c rmtab.c xio.c rpcmisc.c rpcdispatch.c \
 		   svc_create.c atomicio.c strlcat.c strlcpy.c
 libnfs_la_LIBADD = libnfsconf.la
 
-libnfsconf_la_SOURCES = conffile.c xlog.c
+libnfsconf_la_SOURCES = conffile.c passwd_query.c xlog.c
 
 MAINTAINERCLEANFILES = Makefile.in
 

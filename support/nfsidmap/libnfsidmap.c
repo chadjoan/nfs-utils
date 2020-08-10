@@ -60,6 +60,7 @@
 #include "nfsidmap.h"
 #include "nfsidmap_private.h"
 #include "nfsidmap_plugin.h"
+#include "passwd_query.h"
 #include "conffile.h"
 
 #pragma GCC visibility push(hidden)
@@ -452,44 +453,72 @@ int nfs4_init_name_mapping(char *conffile)
 
 	nobody_user = conf_get_str("Mapping", "Nobody-User");
 	if (nobody_user) {
-		size_t buflen = sysconf(_SC_GETPW_R_SIZE_MAX);
-		struct passwd *buf;
-		struct passwd *pw = NULL;
-		int err;
+		char    bufptr[PASSWD_STACKMEM_SIZE_HINT];
+		size_t  buflen = PASSWD_STACKMEM_SIZE_HINT;
+		struct  nfsutil_passwd_query  passwd_query;
 
-		buf = malloc(sizeof(*buf) + buflen);
-		if (buf) {
-			err = getpwnam_r(nobody_user, buf, ((char *)buf) + sizeof(*buf), buflen, &pw);
-			if (err == 0 && pw != NULL)
+		nfsutil_pw_query_init(&passwd_query, bufptr, buflen);
+
+		int err;
+		do {
+			err = nfsutil_pw_query_call_getpwnam_r(&passwd_query, nobody_user);
+		}
+		while ( err == EINTR );
+
+		if ( err == ENOMEM )
+			IDMAP_LOG(0,("libnfsidmap: Nobody-User: no memory : %s",
+					nobody_user, strerror(errno)));
+		else
+		if ( err != 0 )
+			IDMAP_LOG(0, ("libnfsidmap: Nobody-User (%s) lookup failed due to error(s): %s",
+				nobody_user, strerror(errno)));
+		else
+		// No errors.
+		{
+			struct passwd *pw = nfsutil_pw_query_result(&passwd_query);
+			if (pw != NULL)
 				nobody_uid = pw->pw_uid;
 			else
-				IDMAP_LOG(1, ("libnfsidmap: Nobody-User (%s) not found: %s", 
-					nobody_user, strerror(errno)));
-			free(buf);
-		} else
-			IDMAP_LOG(0,("libnfsidmap: Nobody-User: no memory : %s", 
-					nobody_user, strerror(errno)));
+				IDMAP_LOG(1, ("libnfsidmap: Nobody-User (%s) not found.",
+					nobody_user));
+		}
+
+		nfsutil_pw_query_cleanup(&passwd_query);
 	}
 
 	nobody_group = conf_get_str("Mapping", "Nobody-Group");
 	if (nobody_group) {
-		size_t buflen = sysconf(_SC_GETGR_R_SIZE_MAX);
-		struct group *buf;
-		struct group *gr = NULL;
-		int err;
+		char    bufptr[GROUP_STACKMEM_SIZE_HINT];
+		size_t  buflen = GROUP_STACKMEM_SIZE_HINT;
+		struct  nfsutil_group_query  group_query;
 
-		buf = malloc(sizeof(*buf) + buflen);
-		if (buf) {
-			err = getgrnam_r(nobody_group, buf, ((char *)buf) + sizeof(*buf), buflen, &gr);
-			if (err == 0 && gr != NULL)
-				nobody_gid = gr->gr_gid;
+		nfsutil_grp_query_init(&group_query, bufptr, buflen);
+
+		int err;
+		do {
+			err = nfsutil_grp_query_call_getgrnam_r(&group_query, nobody_group);
+		}
+		while ( err == EINTR );
+
+		if ( err == ENOMEM )
+			IDMAP_LOG(0,("libnfsidmap: Nobody-Group: no memory : %s",
+					nobody_group, strerror(errno)));
+		else
+		if ( err != 0 )
+			IDMAP_LOG(0, ("libnfsidmap: Nobody-Group (%s) lookup failed due to error(s): %s",
+				nobody_group, strerror(errno)));
+		else
+		// No errors.
+		{
+			struct group *grp = nfsutil_grp_query_result(&group_query);
+			if (grp != NULL)
+				nobody_gid = grp->gr_gid;
 			else
-				IDMAP_LOG(1, ("libnfsidmap: Nobody-Group (%s) not found: %s", 
-					nobody_group, strerror(errno)));
-			free(buf);
-		} else
-			IDMAP_LOG(0,("libnfsidmap: Nobody-Group: no memory : %s", 
-					nobody_group, strerror(errno)));
+				IDMAP_LOG(1, ("libnfsidmap: Nobody-Group (%s) not found.",
+					nobody_group));
+		}
+
+		nfsutil_grp_query_cleanup(&group_query);
 	}
 
 	ret = 0;
