@@ -55,17 +55,6 @@
  * in idmapd.conf.
  */
 
-struct passwd_ints {
-	uid_t  uid;
-	gid_t  gid;
-	int    return_code; // Return code from getpwnam_r or getpwuid_r.
-};
-
-struct group_ints {
-	gid_t  gid;
-	int    return_code; // Return code from getgrnam_r or getgrgid_r.
-};
-
 struct uid_mapping {
 	LIST_ENTRY (uid_mapping) link;
 	uid_t uid;
@@ -95,220 +84,95 @@ static __inline__ u_int8_t gid_hash (gid_t gid)
 LIST_HEAD (uid_mappings, uid_mapping) uid_mappings[256];
 LIST_HEAD (gid_mappings, gid_mapping) gid_mappings[256];
 
-static int static_inner_getpwnam(
-				struct nfsutil_passwd_query *query,
-				const char *name,
-				const char *UNUSED(domain))
-{
-	char *localname = conf_get_str("Static", (char *)name);
-	if (!localname)
-		return ENOENT;
-
-	// Call getpwnam_r.
-	int err;
-	do {
-		err = nfsutil_pw_query_call_getpwnam_r(query, localname);
-	}
-	while ( err == EINTR );
-
-	// Print errors.
-	if ( err == EIO )
-		IDMAP_LOG(0, ("static_getpwnam: "
-			"I/O error while looking up local name '%s' for Static entry with name '%s'",
-			localname, name));
-	else
-	if ( err == EMFILE )
-		IDMAP_LOG(0, ("static_getpwnam: "
-			"Error while looking up local name '%s' for Static entry with name '%s': "
-			"All file descriptors available to the process are currently open.",
-			localname, name));
-	else
-	if ( err == ENFILE )
-		IDMAP_LOG(0, ("static_getpwnam: "
-			"Error while looking up local name '%s' for Static entry with name '%s': "
-			"The maximum allowable number of files is currently open in the system.",
-			localname, name));
-	else
-	if ( err != 0 )
-	{
-		// Calling strerror is undesirable (thread safety and such), but this
-		// branch should not get executed anyways (we have exhausted all error
-		// codes returned by getpwnam_r/nfsutil_pw_query_call_getpwnam_r),
-		// and if execution does reach this point, we are getting desparate
-		// enough to risk it.
-		const char *errmsg = strerror(err);
-		IDMAP_LOG(0, ("static_getpwnam: "
-			"Unknown error while looking up local name '%s' for Static entry with name '%s'. "
-			"%s%s",
-			localname, name,
-			errmsg ? " strerror reports this: " : "",
-			errmsg ? errmsg : ""));
-	}
-
-	// Error recovery/response is handled by the caller.
-	if (err != 0)
-		return err;
-
-	err = 0;
-	struct passwd *pw = nfsutil_pw_query_result(query);
-	if (!pw)
-		err = ENOENT;
-
-	if ( err == ENOENT )
-		IDMAP_LOG(0, ("static_getpwnam: localname '%s' for '%s' not found",
-			localname, name));
-	else
-		IDMAP_LOG(4, ("static_getpwnam: name '%s' mapped to '%s'",
-			name, localname));
-
-	return err;
-}
-
-static struct passwd_ints static_getpwnam(
-		const char *name,
-		const char *UNUSED(domain),
-		struct passwd **pw_result // NULL indicates that the caller doesn't need it.
+static void static_print_getpwnam_outcome(
+		ssize_t return_code,
+		const char *local_user,
+		const char *entry_name
 	)
 {
-	char    bufptr[PASSWD_STACKMEM_SIZE_HINT];
-	size_t  buflen = PASSWD_STACKMEM_SIZE_HINT;
-	struct  nfsutil_passwd_query  passwd_query;
-	struct  passwd       *pw_tmp    = NULL;
-	struct  passwd_ints  results_lite;
-
-	nfsutil_pw_query_init(&passwd_query, bufptr, buflen);
-
-	int err = static_inner_getpwnam(&passwd_query, name, NULL);
-	pw_tmp = nfsutil_pw_query_result(&passwd_query);
-	// We won't worry about `pw_tmp` being NULL or `err` being non-zero
-	// because `nfsutil_clone_passwd` effectively becomes a no-op under such conditions.
-
-	if ( pw_result != NULL ) // true if caller requires these results
-	{
-		// The caller will be responsible for calling `free` on `*pw_result`.
-		int oom = nfsutil_clone_passwd(pw_result, pw_tmp);
-		if ( oom ) // Only ENOMEM should be possible.
-			err = oom;
-		// Any errors in nfsutil_clone_passwd will set `*pw_result` to NULL.
-	}
-
-	// Populate the returnable results structure.
-	if ( pw_tmp ) {
-		results_lite.uid = pw_tmp->pw_uid;
-		results_lite.gid = pw_tmp->pw_gid;
-	} else {
-		results_lite.uid = (uid_t)(-1);
-		results_lite.gid = (gid_t)(-1);
-	}
-
-	results_lite.return_code = err;
-
-	// It is always safe to call the cleanup function as long as we're done
-	// with the query object.
-	nfsutil_pw_query_cleanup(&passwd_query);
-
-	return results_lite;
+	if ( return_code == 0 )
+		IDMAP_LOG(4, ("static_getpwnam: name '%s' mapped to '%s'",
+			entry_name, local_user));
+	else
+	if ( return_code == ENOENT ) // For compatibility with previously existing error message.
+		IDMAP_LOG(0, ("static_getpwnam: localname '%s' for '%s' not found",
+			local_user, entry_name));
+	else
+		nfsidmap_print_pwgrp_error(
+			return_code, "static_getpwnam:",
+			"local name", local_user,
+			" for Static mapping named '", entry_name, "'");
 }
 
-static int static_inner_getgrnam(
-				struct nfsutil_group_query *query,
-				const char *name,
-				const char *UNUSED(domain))
+static struct nfsutil_passwd_ints
+	static_getpwnam( const char *name, const char *UNUSED(domain) )
 {
+	struct nfsutil_passwd_ints  pw_ints = nfsutil_passwd_ints_init;
+	char *localname = conf_get_str("Static", (char *)name);
+	if (!localname) {
+		// Should this have an error message?  (It didn't have one before.)
+		// Something like, for example, "static_getpwnam: user '%s' not found in config (ex: idmapd.conf)"
+		// Or is this called speculatively (ex: every plugin/section called
+		// with same name, and all but one are expected to return ENOENT)?
+		// -- Chad Joan  2020-08-12
+		pw_ints.err = ENOENT;
+		return pw_ints;
+	}
+
+	// Call getpwnam_r.
+	do {
+		pw_ints = nfsutil_getpwnam_ints(localname);
+	}
+	while ( pw_ints.err == EINTR );
+
+	static_print_getpwnam_outcome(pw_ints.err, localname, name);
+	return pw_ints;
+}
+
+static void static_print_getgrnam_outcome(
+		ssize_t return_code,
+		const char *local_group,
+		const char *entry_name
+	)
+{
+	if ( return_code == 0 )
+		IDMAP_LOG(4, ("static_getgrnam: group '%s' mapped to '%s'",
+			entry_name, local_group));
+	else
+	if ( return_code == ENOENT ) // For compatibility with previously existing error message.
+		IDMAP_LOG(0, ("static_getgrnam: local group '%s' for '%s' not found",
+			local_group, entry_name));
+	else
+		nfsidmap_print_pwgrp_error(
+			return_code, "static_getgrnam:",
+			"local group", local_group,
+			" for Static mapping named '", entry_name, "'");
+}
+
+static struct nfsutil_group_ints
+	static_getgrnam( const char *name, const char *UNUSED(domain) )
+{
+	struct nfsutil_group_ints  grp_ints = nfsutil_group_ints_init;
 	char *localgroup = conf_get_str("Static", (char *)name);
-	if (!localgroup)
-		return ENOENT;
+	if (!localgroup) {
+		// Should this have an error message?  (It didn't have one before.)
+		// Something like, for example, "static_getgrnam: group '%s' not found in config (ex: idmapd.conf)"
+		// Or is this called speculatively (ex: every plugin/section called
+		// with same name, and all but one are expected to return ENOENT)?
+		// -- Chad Joan  2020-08-12
+		grp_ints.err = ENOENT;
+		return grp_ints;
+	}
 
 	// Call getgrnam_r.
-	int err;
 	do {
-		err = nfsutil_grp_query_call_getgrnam_r(query, localgroup);
+		grp_ints = nfsutil_getgrnam_ints(localgroup);
 	}
-	while ( err == EINTR );
+	while ( grp_ints.err == EINTR );
 
-	// Print errors.
-	if ( err == EIO )
-		IDMAP_LOG(0, ("static_getgrnam: "
-			"I/O error while looking up local group '%s' for Static entry with name '%s'",
-			localgroup, name));
-	else
-	if ( err == EMFILE )
-		IDMAP_LOG(0, ("static_getgrnam: "
-			"Error while looking up local group '%s' for Static entry with name '%s': "
-			"All file descriptors available to the process are currently open.",
-			localgroup, name));
-	else
-	if ( err == ENFILE )
-		IDMAP_LOG(0, ("static_getgrnam: "
-			"Error while looking up local group '%s' for Static entry with name '%s': "
-			"The maximum allowable number of files is currently open in the system.",
-			localgroup, name));
-	else
-	if ( err != 0 )
-	{
-		// Calling strerror is undesirable (thread safety and such), but this
-		// branch should not get executed anyways (we have exhausted all error
-		// codes returned by getgrnam_r/nfsutil_grp_query_call_getgrnam_r),
-		// and if execution does reach this point, we are getting desparate
-		// enough to risk it.
-		const char *errmsg = strerror(err);
-		IDMAP_LOG(0, ("static_getgrnam: "
-			"Unknown error while looking up local group '%s' for Static entry with name '%s'. "
-			"%s%s",
-			localgroup, name,
-			errmsg ? " strerror reports this: " : "",
-			errmsg ? errmsg : ""));
-	}
-
-	// Error recovery/response is handled by the caller.
-	if (err != 0)
-		return err;
-
-	err = 0;
-	struct group *grp = nfsutil_grp_query_result(query);
-	if (!grp)
-		err = ENOENT;
-
-	if ( err == ENOENT )
-		IDMAP_LOG(0, ("static_getgrnam: local group '%s' for '%s' not found",
-			localgroup, name));
-	else
-		IDMAP_LOG(4, ("static_getgrnam: group '%s' mapped to '%s'",
-			name, localgroup));
-
-	return err;
+	static_print_getgrnam_outcome(grp_ints.err, localgroup, name);
+	return grp_ints;
 }
-
-static struct group_ints static_getgrnam(
-		const char *name,
-		const char *UNUSED(domain))
-{
-	char    bufptr[GROUP_STACKMEM_SIZE_HINT];
-	size_t  buflen = GROUP_STACKMEM_SIZE_HINT;
-	struct  nfsutil_group_query  group_query;
-	struct  group       *grp_tmp    = NULL;
-	struct  group_ints  results_lite;
-
-	nfsutil_grp_query_init(&group_query, bufptr, buflen);
-
-	int err = static_inner_getgrnam(&group_query, name, NULL);
-	grp_tmp = nfsutil_grp_query_result(&group_query);
-
-	// Populate the returnable results structure.
-	if ( grp_tmp )
-		results_lite.gid = grp_tmp->gr_gid;
-	else
-		results_lite.gid = (gid_t)(-1);
-
-	results_lite.return_code = err;
-
-	// It is always safe to call the cleanup function as long as we're done
-	// with the query object.
-	nfsutil_grp_query_cleanup(&group_query);
-
-	return results_lite;
-}
-
 
 static int static_gss_princ_to_ids(char *secname, char *princ,
 				   uid_t *uid, uid_t *gid,
@@ -318,8 +182,8 @@ static int static_gss_princ_to_ids(char *secname, char *princ,
 	if (strcmp(secname, "krb5") != 0 && strcmp(secname, "spkm3") != 0)
 		return -EINVAL;
 
-	struct passwd_ints pw_ints = static_getpwnam(princ, NULL, NULL);
-	int err = pw_ints.return_code;
+	struct nfsutil_passwd_ints pw_ints = static_getpwnam(princ, NULL);
+	int err = pw_ints.err;
 
 	if (!err) {
 		*uid = pw_ints.uid;
@@ -337,23 +201,36 @@ static int static_gss_princ_to_grouplist(char *secname, char *princ,
 	if (strcmp(secname, "krb5") != 0 && strcmp(secname, "spkm3") != 0)
 		return -EINVAL;
 
-	struct passwd *pw;
-	struct passwd_ints pw_ints = static_getpwnam(princ, NULL, &pw);
-	int err = pw_ints.return_code;
+	struct nfsutil_passwd_ints pw_ints;
+	pw_ints = static_getpwnam(princ, NULL);
+	int err = pw_ints.err;
 
-	if (pw) {
-		if (getgrouplist(pw->pw_name, pw->pw_gid, groups, ngroups) < 0)
-			err = -ERANGE;
-		free(pw);
+	if (err)
+		return -err;
+
+	do {
+		err = nfsutil_getgrouplist_by_uid(
+			pw_ints.uid, pw_ints.gid, groups, ngroups);
 	}
+	while ( err == EINTR );
+
+	// Note: The caller should handle ERANGE by calling us again
+	//       with a larger `groups` buffer.
+	// `nfsidmap_print_pwgrp_error` might not print the right thing for
+	// ERANGE anyways, because it's meaning here is pretty specific to
+	// getgrouplist's array sizing.
+	if ( err != ERANGE )
+		nfsidmap_print_pwgrp_error(err, "static_gss_princ_to_grouplist",
+			"user name", princ, "", "", "");
 
 	return -err;
 }
 
 static int static_name_to_uid(char *name, uid_t *uid)
 {
-	struct passwd_ints pw_ints = static_getpwnam(name, NULL, NULL);
-	int err = pw_ints.return_code;
+	struct nfsutil_passwd_ints  pw_ints;
+	pw_ints = static_getpwnam(name, NULL);
+	int err = pw_ints.err;
 
 	if (!err)
 		*uid = pw_ints.uid;
@@ -363,8 +240,9 @@ static int static_name_to_uid(char *name, uid_t *uid)
 
 static int static_name_to_gid(char *name, gid_t *gid)
 {
-	struct group_ints grp_ints = static_getgrnam(name, NULL);
-	int err = grp_ints.return_code;
+	struct nfsutil_group_ints  grp_ints;
+	grp_ints = static_getgrnam(name, NULL);
+	int err = grp_ints.err;
 
 	if (!err)
 		*gid = grp_ints.gid;
@@ -438,8 +316,9 @@ static int static_init(void) {
 	{ 
 		next = TAILQ_NEXT (cln, link); 
 
-		struct passwd_ints pw_ints = static_getpwnam(cln->field, NULL, NULL);
-		err = pw_ints.return_code;
+		struct nfsutil_passwd_ints pw_ints =
+			static_getpwnam(cln->field, NULL);
+		err = pw_ints.err;
 		if (err)
 			continue;
 
@@ -470,8 +349,9 @@ static int static_init(void) {
 	{ 
 		next = TAILQ_NEXT (cln, link); 
 
-		struct group_ints grp_ints = static_getgrnam(cln->field, NULL);
-		err = grp_ints.return_code;
+		struct nfsutil_group_ints  grp_ints;
+		grp_ints = static_getgrnam(cln->field, NULL);
+		err = grp_ints.err;
 		if (err)
 			continue;
 		

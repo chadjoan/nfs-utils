@@ -33,11 +33,13 @@
  *  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <assert.h>
 #include <errno.h>
 #include <grp.h>
 #include <pwd.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>  // For uid_t/gid_t
@@ -858,7 +860,6 @@ struct group *nfsutil_copy_group(
 		grp_to->gr_mem = NULL;
 	else
 	{
-		char *cursor_before = cursor;
 		char **members_from = grp_from->gr_mem;
 		char **members_to   = (char**)cursor;
 
@@ -909,4 +910,601 @@ int nfsutil_clone_group(
 	str_buffer += sizeof(**grp_to);
 	nfsutil_copy_group(*grp_to, grp_from, str_buffer);
 	return 0;
+}
+
+
+const struct nfsutil_passwd_ints
+	nfsutil_passwd_ints_init = {
+		.uid = (uid_t)(-1),
+		.gid = (gid_t)(-1),
+		.err = 0
+	};
+
+
+const struct nfsutil_group_ints
+	nfsutil_group_ints_init = {
+		.gid = (gid_t)(-1),
+		.err = 0
+	};
+
+// Calls the appropriate `getpw***_r` function according to `key` and `key_is_name`.
+// The returned struct has the `uid` and `gid` fields set according to whatever
+// is found using `getpw***_r`, or are set to (uid_t)(-1) or (gid_t)(-1) if
+// the record was not found. The return value's `err` field will be set to
+// whatever `getpw***_r` returned, and `found` will be set to 0 if the record
+// was not found or 1 if the record was found. The caller should not use the
+// `uid` and `gid` fields if the returned struct's `err` field is non-zero or
+// its `found` field is 0.
+//
+// If the caller passes a non-NULL value for `full_results`, this function will
+// set `*full_results` to either the `passwd` struct returned by the `getpw***_r`
+// function, or to NULL if the record was not found or an error occurred during
+// the call.
+//
+static struct nfsutil_passwd_ints
+	nfsutil_getpwxxx_r(struct passwd **full_results, union pwgrp_key key, uint8_t key_is_name)
+{
+	char    bufptr[PASSWD_STACKMEM_SIZE_HINT];
+	size_t  buflen = PASSWD_STACKMEM_SIZE_HINT;
+	struct  nfsutil_passwd_query  passwd_query;
+	struct  passwd                *pw_tmp = NULL;
+
+	nfsutil_pw_query_init(&passwd_query, bufptr, buflen);
+
+	int err;
+	if ( key_is_name )
+		err = nfsutil_pw_query_call_getpwnam_r(&passwd_query, key.as_name);
+	else
+		err = nfsutil_pw_query_call_getpwuid_r(&passwd_query, key.as_uid);
+
+	pw_tmp = nfsutil_pw_query_result(&passwd_query);
+
+	// Populate the full_results if the caller requested them.
+	if ( full_results != NULL ) // true if caller requires these results
+	{
+		// We won't worry about `pw_tmp` being NULL or `err` being non-zero
+		// because `nfsutil_clone_passwd` effectively becomes a no-op under such conditions.
+
+		// The caller will be responsible for calling `free` on `*full_results`.
+		int oom = nfsutil_clone_passwd(full_results, pw_tmp);
+		if ( oom ) // Only ENOMEM should be possible.
+			err = oom;
+		// Any errors in nfsutil_clone_passwd will set `*full_results` to NULL.
+	}
+
+	// Populate the returnable results structure.
+	struct  nfsutil_passwd_ints   pw_ints = nfsutil_passwd_ints_init;
+	int found = 0;
+	if ( pw_tmp ) {
+		pw_ints.uid = pw_tmp->pw_uid;
+		pw_ints.gid = pw_tmp->pw_gid;
+		found = 1;
+	}
+
+	if ( err == 0 && !found ) // No errors, it just wasn't found.
+		pw_ints.err = ENOENT;
+	else
+		pw_ints.err = err;
+
+	// It is always safe to call the cleanup function as long as we're done
+	// with the query object.
+	nfsutil_pw_query_cleanup(&passwd_query);
+
+	return pw_ints;
+}
+
+struct nfsutil_passwd_ints
+	nfsutil_getpwnam_ints(const char *user_name)
+{
+	int key_is_name = 1;
+	union pwgrp_key  key;
+	key.as_name = user_name;
+	return nfsutil_getpwxxx_r(NULL, key, key_is_name);
+}
+
+struct nfsutil_passwd_ints
+	nfsutil_getpwuid_ints(uid_t uid)
+{
+	int key_is_name = 0;
+	union pwgrp_key  key;
+	key.as_uid = uid;
+	return nfsutil_getpwxxx_r(NULL, key, key_is_name);
+}
+
+int nfsutil_getpwnam_struct(struct passwd **pw, const char *user_name)
+{
+	int key_is_name = 1;
+	union pwgrp_key  key;
+	key.as_name = user_name;
+
+	struct nfsutil_passwd_ints  pw_ints =
+		nfsutil_getpwxxx_r(pw, key, key_is_name);
+
+	return pw_ints.err;
+}
+
+int nfsutil_getpwuid_struct(struct passwd **pw,  uid_t uid)
+{
+	int key_is_name = 0;
+	union pwgrp_key  key;
+	key.as_uid = uid;
+
+	struct nfsutil_passwd_ints  pw_ints =
+		nfsutil_getpwxxx_r(pw, key, key_is_name);
+
+	return pw_ints.err;
+}
+
+// Calls the appropriate `getgr***_r` function according to `key` and `key_is_name`.
+// The returned struct has its `gid` field set according to whatever is found
+// using `getgr***_r`, or is set to (gid_t)(-1) if the record was not found.
+// The return value's `err` field will be set to whatever `getgr***_r` returned,
+// and `found` will be set to 0 if the record was not found or 1 if the record
+// was found. The caller should not use the `gid` field if the returned struct's
+// `err` field is non-zero or its `found` field is 0.
+//
+// If the caller passes a non-NULL value for `full_results`, this function will
+// set `*full_results` to either the `group` struct returned by the `getgr***_r`
+// function, or to NULL if the record was not found or an error occurred during
+// the call.
+//
+static struct nfsutil_group_ints
+	nfsutil_getgrxxx_r(struct group **full_results, union pwgrp_key key, uint8_t key_is_name)
+{
+	char    bufptr[GROUP_STACKMEM_SIZE_HINT];
+	size_t  buflen = GROUP_STACKMEM_SIZE_HINT;
+	struct  nfsutil_group_query  group_query;
+	struct  group                *grp_tmp = NULL;
+
+	nfsutil_grp_query_init(&group_query, bufptr, buflen);
+
+	int err;
+	if ( key_is_name )
+		err = nfsutil_grp_query_call_getgrnam_r(&group_query, key.as_name);
+	else
+		err = nfsutil_grp_query_call_getgrgid_r(&group_query, key.as_gid);
+
+	grp_tmp = nfsutil_grp_query_result(&group_query);
+
+	// Populate the full_results if the caller requested them.
+	if ( full_results != NULL ) // true if caller requires these results
+	{
+		// We won't worry about `grp_tmp` being NULL or `err` being non-zero
+		// because `nfsutil_clone_group` effectively becomes a no-op under such conditions.
+
+		// The caller will be responsible for calling `free` on `*full_results`.
+		int oom = nfsutil_clone_group(full_results, grp_tmp);
+		if ( oom ) // Only ENOMEM should be possible.
+			err = oom;
+		// Any errors in nfsutil_clone_group will set `*full_results` to NULL.
+	}
+
+	// Populate the returnable results structure.
+	struct  nfsutil_group_ints   grp_ints = nfsutil_group_ints_init;
+	int found = 0;
+	if ( grp_tmp ) {
+		grp_ints.gid = grp_tmp->gr_gid;
+		found = 1;
+	}
+
+	if ( err == 0 && !found ) // No errors, it just wasn't found.
+		grp_ints.err = ENOENT;
+	else
+		grp_ints.err = err;
+
+	// It is always safe to call the cleanup function as long as we're done
+	// with the query object.
+	nfsutil_grp_query_cleanup(&group_query);
+
+	return grp_ints;
+}
+
+struct nfsutil_group_ints
+	nfsutil_getgrnam_ints(const char *group_name)
+{
+	int key_is_name = 1;
+	union pwgrp_key  key;
+	key.as_name = group_name;
+	return nfsutil_getgrxxx_r(NULL, key, key_is_name);
+}
+
+struct nfsutil_group_ints
+	nfsutil_getgrgid_ints(gid_t gid)
+{
+	int key_is_name = 0;
+	union pwgrp_key  key;
+	key.as_gid = gid;
+	return nfsutil_getgrxxx_r(NULL, key, key_is_name);
+}
+
+int nfsutil_getgrnam_struct(struct group **grp, const char *group_name)
+{
+	int key_is_name = 1;
+	union pwgrp_key  key;
+	key.as_name = group_name;
+
+	struct nfsutil_group_ints  grp_ints =
+		nfsutil_getgrxxx_r(grp, key, key_is_name);
+
+	return grp_ints.err;
+}
+
+int nfsutil_getgrgid_struct(struct group **grp,  gid_t gid)
+{
+	int key_is_name = 0;
+	union pwgrp_key  key;
+	key.as_gid = gid;
+
+	struct nfsutil_group_ints  grp_ints =
+		nfsutil_getgrxxx_r(grp, key, key_is_name);
+
+	return grp_ints.err;
+}
+
+// See header for documentation.
+int nfsutil_getgrouplist_by_uid(
+		uid_t user_uid, gid_t user_gid,
+		gid_t *groups, int *ngroups
+	)
+{
+	char    bufptr[PASSWD_STACKMEM_SIZE_HINT];
+	size_t  buflen = PASSWD_STACKMEM_SIZE_HINT;
+	struct  nfsutil_passwd_query  passwd_query;
+	struct  passwd                *pw = NULL;
+
+	nfsutil_pw_query_init(&passwd_query, bufptr, buflen);
+
+	int err = nfsutil_pw_query_call_getpwuid_r(&passwd_query, user_uid);
+	pw = nfsutil_pw_query_result(&passwd_query);
+
+	if ( !err && pw == NULL )
+		err = ENOENT;
+	else
+	if ( !err && pw != NULL ) {
+		const char *user_name = pw->pw_name;
+		if ( user_gid == (gid_t)(-1) )
+			user_gid = pw->pw_gid;
+
+		int rc = getgrouplist(user_name, user_gid, groups, ngroups);
+		if ( rc < 0 )
+			err = ERANGE;
+
+		// The caller is responsible for checking the outgoing results
+		// given by the arguments.
+	}
+
+	nfsutil_pw_query_cleanup(&passwd_query);
+
+	return err;
+}
+
+
+// This is like strlen, except that it doubles the cost of every '%'
+// character it encounters to compensate for situations where such characters
+// need to be escaped ("%" -> "%%") to perform double-expansion mitigation.
+//
+static size_t format_expansion_length(const char *str)
+{
+	size_t result = 0;
+	for ( size_t i = 0;; i++ )
+	{
+		char ch = str[i];
+		if ( ch == '\0' )
+			break;
+		else
+		if ( ch == '%' )
+			result += 2;
+		else
+			result++;
+	}
+	return result;
+}
+
+void test__format_expansion_length(void)
+{
+	assert(format_expansion_length("") == 0);
+	assert(format_expansion_length("a") == 1);
+	assert(format_expansion_length(".") == 1);
+	assert(format_expansion_length("%") == 2);
+	assert(format_expansion_length("aa") == 2);
+	assert(format_expansion_length("a%") == 3);
+	assert(format_expansion_length("%s") == 3);
+	assert(format_expansion_length("%%") == 4);
+	assert(format_expansion_length("%a%a") == 6);
+	assert(format_expansion_length("a%a%") == 6);
+	assert(format_expansion_length("aaaa") == 4);
+}
+
+// Returns: The size of the new string, not including the nul-terminating character.
+static size_t escape_fmtspec_inplace(char *bufptr, size_t buflen)
+{
+	ssize_t i; // Index on `bufptr` before substitution.
+	ssize_t j; // Index on `bufptr` after substitution.
+
+	size_t newlen = 0;
+
+	if ( bufptr == NULL || buflen == 0 )
+		return 0;
+
+	ssize_t bufend = buflen-1; // Last valid char index.
+
+	// Pass 1: count the replacements and find the '\0' byte.
+	i = 0; j = 0;
+	while(j < bufend)
+	{
+		char ch = bufptr[i];
+		if ( ch == '\0' )
+			break;
+
+		if ( ch == '%' ) {
+			if ( j == bufend-2 ) {
+				// Allocate space for "%%\0" if near end.
+				bufptr[++i] = '\0';
+				j += 2;
+				break;
+			}
+			else
+			if ( j == bufend-1 ) {
+				// There's no room for "%%\0", so drop this '%'.
+				// Just make sure we can put "\0".
+				bufptr[i] = '\0';
+				break;
+			}
+			else {
+				// The end is not near.
+				i++;
+				j += 2;
+			}
+		} else {
+			// Normalcy.
+			i++; j++;
+		}
+	}
+
+	newlen = j;
+
+	// Pass 2: work backwards to shift everything into its final place while
+	//   filling the gaps with the substituted characters.
+	while ( j > i )
+	{
+		char ch = bufptr[i--];
+		bufptr[j--] = ch;
+		if ( ch == '%' )
+			bufptr[j--] = '%';
+	}
+	// assert( i == j );
+	// assert( i >= 0 );
+
+	return newlen;
+}
+
+static char *escape_fmtspec(const char *str, char *bufptr, size_t buflen)
+{
+	size_t sz = strlen(str)+1;
+	if ( sz > buflen )
+		sz = buflen;
+	memcpy(bufptr, str, sz);
+	if ( sz == buflen )
+		bufptr[sz-1] = '\0';
+	(void)escape_fmtspec_inplace(bufptr, buflen);
+	return bufptr;
+}
+
+void test__escape_fmtspec_inplace(void)
+{
+	char   p[16];
+	size_t l = 16;
+
+	assert(escape_fmtspec_inplace(NULL,0) == 0);
+	assert(escape_fmtspec_inplace(NULL,1) == 0);
+	assert(escape_fmtspec_inplace(p,   0) == 0);
+	assert(strcmp(escape_fmtspec("",   p, l), "")     == 0);
+	assert(strcmp(escape_fmtspec("a",  p, l), "a")    == 0);
+	assert(strcmp(escape_fmtspec(".",  p, l), ".")    == 0);
+	assert(strcmp(escape_fmtspec("a",  p, 1), "")     == 0);
+	assert(strcmp(escape_fmtspec("%",  p, l), "%%")   == 0);
+	assert(strcmp(escape_fmtspec("%",  p, 2), "")     == 0);
+	assert(strcmp(escape_fmtspec("%",  p, 3), "%%")   == 0);
+	assert(strcmp(escape_fmtspec("aa", p, l), "aa")   == 0);
+	assert(strcmp(escape_fmtspec("aa", p, 2), "a")    == 0);
+	assert(strcmp(escape_fmtspec("aa", p, 3), "aa")   == 0);
+	assert(strcmp(escape_fmtspec("a%", p, l), "a%%")  == 0);
+	assert(strcmp(escape_fmtspec("a%", p, 2), "a")    == 0);
+	assert(strcmp(escape_fmtspec("a%", p, 3), "a")    == 0);
+	assert(strcmp(escape_fmtspec("a%", p, 4), "a%%")  == 0);
+	assert(strcmp(escape_fmtspec("%s", p, l), "%%s")  == 0);
+	assert(strcmp(escape_fmtspec("%s", p, 2), "")     == 0);
+	assert(strcmp(escape_fmtspec("%s", p, 3), "%%")   == 0);
+	assert(strcmp(escape_fmtspec("%s", p, 4), "%%s")  == 0);
+	assert(strcmp(escape_fmtspec("%%", p, l), "%%%%") == 0);
+	assert(strcmp(escape_fmtspec("%%", p, 2), "")     == 0);
+	assert(strcmp(escape_fmtspec("%%", p, 3), "%%")   == 0);
+	assert(strcmp(escape_fmtspec("%%", p, 4), "%%")   == 0);
+	assert(strcmp(escape_fmtspec("%%", p, 5), "%%%%") == 0);
+	assert(strcmp(escape_fmtspec("%a%a", p, l), "%%a%%a") == 0);
+	assert(strcmp(escape_fmtspec("a%a%", p, l), "a%%a%%") == 0);
+	assert(strcmp(escape_fmtspec("aaaa", p, l), "aaaa")   == 0);
+}
+
+#ifndef IDMAP_LOG
+#define IDMAP_LOG(lvl, args)  do { (printf)args; fputc('\n', stdout); } while (0)
+#endif
+
+// `buflen` is the length of the buffer needed to hold the result of formatting
+// `fmtstr` with the arguments that follow it in this parameter list.
+static void nfsidmap_print_oom_error(
+		size_t      buflen,
+		const char  *fmtstr,
+		const char  *in_function,
+		const char  *key_name,
+		const char  *key_value,
+		const char  *rel_entry_before,
+		const char  *rel_entry_value,
+		const char  *rel_entry_after
+	)
+{
+	// (Carefully) Exploit VLAs to avoid heap allocation during string formatting.
+	char bufptr[buflen];
+
+	// Use snprintf to do formatting. Pray that it doesn't malloc for no reason.
+	ssize_t return_code =
+		snprintf(bufptr, buflen, fmtstr,
+			in_function, key_name, key_value,
+			rel_entry_before, rel_entry_value, rel_entry_after);
+
+	// If snprintf returned an error code, we are in no condition to handle it.
+	// But we do want to avoid trying to use a potentially b0rked result,
+	// so we back off if there's an error code at all.
+	if ( return_code <= 0 )
+		return;
+
+	// The size of the already-formatted string, including the '\0' byte
+	// at the end.
+	size_t string_length = return_code+1;
+
+	// If string_length > buflen, it means that the full format expansion
+	// would be larger than our buffer, so snprintf had to stop.
+	// We could give up due to that error OR... we could just truncate
+	// the thing and hope for the best.
+	// This is all best-effort anyways, so hell, why not.
+	// Basically, it gives us best odds of informing the user about this.
+	// (Also this shouldn't happen if the caller correctly calculated the
+	// necessary final string length.)
+	if ( string_length > buflen ) {
+		bufptr[buflen-1] = '\0';
+		string_length = buflen;
+	}
+
+	// Double up (escape) any formatter characters ('%') that are left
+	// in the string, because we've already formatted it and IDMAP_LOG
+	// is /also/ formatting. Ideally we wouldn't format twice, but
+	// it's hard to know if the formatter behind IDMAP_LOG uses
+	// malloc or not. With any luck, it will see a string with no
+	// substitutions to make, and will just pass it through to
+	// whatever output buffer awaits it.
+	(void)escape_fmtspec_inplace(bufptr, buflen);
+	char *errmsg = bufptr;
+
+#if defined(_MSC_VER)
+#pragma warning( push )
+#pragma warning( disable : 4774 )
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
+#endif
+	// If IDMAP_LOG tries to heap-allocate, it might fail, and we'd be
+	// bumming regardless. But at least we tried. The worse that could
+	// happen is that malloc returns NULL again.
+	IDMAP_LOG(0, (errmsg));
+#if defined(_MSC_VER)
+#pragma warning( pop )
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+}
+
+// See header for documentation.
+//
+// `nfsidmap_print_pwgrp_error` prints error messages resulting from
+// `get**nam_r` and `get***id_r` functions, (usually) using the following format:
+// "${in_function}: Error happened while looking up ${key_name} '${key_value}'"
+//     "${rel_entry_before}${rel_entry_value}${rel_entry_after}': <error message>"
+void nfsidmap_print_pwgrp_error(
+		ssize_t     err,
+		const char  *in_function,
+		const char  *key_name, // Ex: "user name", "local name", "uid", "gid", etc.
+		const char  *key_value,
+		const char  *rel_entry_before, // Ex: " for Static entry with name '", " in domain '", etc
+		const char  *rel_entry_value,  // Ex: "foo@bar", "your_domain_here" 
+		const char  *rel_entry_after   // Ex: "'", or put (NULL|"") if you're not using a related entry.
+	)
+{
+	if ( rel_entry_before == NULL )
+		rel_entry_before = "";
+	if ( rel_entry_value == NULL )
+		rel_entry_value = "";
+	if ( rel_entry_after == NULL )
+		rel_entry_after = "";
+
+	// Print errors.
+	if ( err == ENOENT || err == -ENOENT )
+		IDMAP_LOG(0, ("%s: "
+			"Error while looking up %s '%s'%s%s%s: not found",
+			in_function, key_name, key_value,
+			rel_entry_before, rel_entry_value, rel_entry_after));
+	else
+	if ( err == EIO || err == -EIO )
+		IDMAP_LOG(0, ("%s: "
+			"Error while looking up %s '%s'%s%s%s: I/O error.",
+			in_function, key_name, key_value,
+			rel_entry_before, rel_entry_value, rel_entry_after));
+	else
+	if ( err == EINTR || err == -EINTR )
+		IDMAP_LOG(0, ("%s: "
+			"Error: a signal was caught while looking up %s '%s'%s%s%s: ",
+			in_function, key_name, key_value,
+			rel_entry_before, rel_entry_value, rel_entry_after));
+	else
+	if ( err == EMFILE || err == -EMFILE )
+		IDMAP_LOG(0, ("%s: "
+			"Error while looking up %s '%s'%s%s%s: "
+			"All file descriptors available to the process are currently open.",
+			in_function, key_name, key_value,
+			rel_entry_before, rel_entry_value, rel_entry_after));
+	else
+	if ( err == ENFILE || err == -ENFILE )
+		IDMAP_LOG(0, ("%s: "
+			"Error while looking up %s '%s'%s%s%s: "
+			"The maximum allowable number of files is currently open in the system.",
+			in_function, key_name, key_value,
+			rel_entry_before, rel_entry_value, rel_entry_after));
+	else
+	if ( err == ENOMEM || err == -ENOMEM )
+	{
+		const char *errfmtstr = "%s: "
+			"Error while looking up %s '%s'%s%s%s: "
+			"Out of memory (OOM); memory allocation failed; no memory.";
+
+		size_t fmtmemsize = format_expansion_length(errfmtstr);
+		fmtmemsize += format_expansion_length(in_function);
+		fmtmemsize += format_expansion_length(key_name);
+		fmtmemsize += format_expansion_length(key_value);
+		fmtmemsize += format_expansion_length(rel_entry_before);
+		fmtmemsize += format_expansion_length(rel_entry_value);
+		fmtmemsize += format_expansion_length(rel_entry_after);
+		fmtmemsize += 1; // Make sure there's room for '\0'.
+
+		nfsidmap_print_oom_error(fmtmemsize, errfmtstr,
+			in_function, key_name, key_value,
+			rel_entry_before, rel_entry_value, rel_entry_after);
+	}
+	else
+	if ( err == ERANGE || err == -ERANGE )
+		// Notably, this branch should never execute if (passwd|group)_query
+		// objects were used to call the `get*****_r` function, as that function
+		// will always find an appropriate buffer size that is large enough
+		// for the lookup to complete.
+		IDMAP_LOG(0, ("%s: "
+			"Error while looking up %s '%s'%s%s%s: "
+			"Insufficient storage was supplied to contain the data to be "
+			"referenced by the resulting passwd or group structure.",
+			in_function, key_name, key_value,
+			rel_entry_before, rel_entry_value, rel_entry_after));
+	else
+	if ( err != 0 )
+	{
+		// Calling strerror is undesirable (thread safety and such), but this
+		// branch should not get executed anyways (we have exhausted all error
+		// codes returned by getpwnam_r/nfsutil_pw_query_call_getpwnam_r),
+		// and if execution does reach this point, we are getting desparate
+		// enough to risk it.
+		const char *errmsg = strerror(err);
+		IDMAP_LOG(0, ("%s: "
+			"Unknown error while looking up %s '%s'%s%s%s. "
+			"%s%s",
+			in_function, key_name, key_value,
+			rel_entry_before, rel_entry_value, rel_entry_after,
+			errmsg ? " strerror reports this: " : "",
+			errmsg ? errmsg : ""));
+	}
 }

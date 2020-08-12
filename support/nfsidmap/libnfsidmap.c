@@ -453,72 +453,74 @@ int nfs4_init_name_mapping(char *conffile)
 
 	nobody_user = conf_get_str("Mapping", "Nobody-User");
 	if (nobody_user) {
-		char    bufptr[PASSWD_STACKMEM_SIZE_HINT];
-		size_t  buflen = PASSWD_STACKMEM_SIZE_HINT;
-		struct  nfsutil_passwd_query  passwd_query;
-
-		nfsutil_pw_query_init(&passwd_query, bufptr, buflen);
-
-		int err;
+		struct nfsutil_passwd_ints  pw_ints;
 		do {
-			err = nfsutil_pw_query_call_getpwnam_r(&passwd_query, nobody_user);
+			pw_ints = nfsutil_getpwnam_ints(nobody_user);
 		}
-		while ( err == EINTR );
+		while ( pw_ints.err == EINTR );
 
+		int err = pw_ints.err;
+		if ( err == 0 ) {
+			// success
+			IDMAP_LOG(4, ("libnfsidmap: Nobody-User mapped to '%s'",
+				nobody_user));
+			nobody_uid = pw_ints.uid;
+		}
+		/*else
 		if ( err == ENOMEM )
-			IDMAP_LOG(0,("libnfsidmap: Nobody-User: no memory : %s",
-					nobody_user, strerror(errno)));
-		else
-		if ( err != 0 )
-			IDMAP_LOG(0, ("libnfsidmap: Nobody-User (%s) lookup failed due to error(s): %s",
+			// I'm replacing this error message, because:
+			// (1) It is very unlikely that many people encounter this.
+			//         (So there is less chance of scripts scanning for it.)
+			// (2) The `nfsidmap_print_pwgrp_error` function is more careful
+			//         about avoid `malloc` calls, which is important after ENOMEM.
+			//         (So it's more likely to actually work.)
+			// -- Chad Joan  2020-08-12
+			IDMAP_LOG(0, ("libnfsidmap: Nobody-User: no memory : %s",
 				nobody_user, strerror(errno)));
+		*/
 		else
-		// No errors.
-		{
-			struct passwd *pw = nfsutil_pw_query_result(&passwd_query);
-			if (pw != NULL)
-				nobody_uid = pw->pw_uid;
-			else
-				IDMAP_LOG(1, ("libnfsidmap: Nobody-User (%s) not found.",
-					nobody_user));
-		}
-
-		nfsutil_pw_query_cleanup(&passwd_query);
+		if ( err == ENOENT )
+			IDMAP_LOG(1, ("libnfsidmap: Nobody-User (%s) not found.",
+				nobody_user));
+		else
+			nfsidmap_print_pwgrp_error(err, "libnfsidmap",
+				"Nobody-User", nobody_user, "", "", "");
 	}
 
 	nobody_group = conf_get_str("Mapping", "Nobody-Group");
 	if (nobody_group) {
-		char    bufptr[GROUP_STACKMEM_SIZE_HINT];
-		size_t  buflen = GROUP_STACKMEM_SIZE_HINT;
-		struct  nfsutil_group_query  group_query;
-
-		nfsutil_grp_query_init(&group_query, bufptr, buflen);
-
-		int err;
+		struct nfsutil_group_ints  grp_ints;
 		do {
-			err = nfsutil_grp_query_call_getgrnam_r(&group_query, nobody_group);
+			grp_ints = nfsutil_getgrnam_ints(nobody_group);
 		}
-		while ( err == EINTR );
+		while ( grp_ints.err == EINTR );
 
+		int err = grp_ints.err;
+		if ( err == 0 ) {
+			// success
+			IDMAP_LOG(4, ("libnfsidmap: Nobody-Group mapped to '%s'",
+				nobody_group));
+			nobody_gid = grp_ints.gid;
+		}
+		/*else
 		if ( err == ENOMEM )
-			IDMAP_LOG(0,("libnfsidmap: Nobody-Group: no memory : %s",
-					nobody_group, strerror(errno)));
-		else
-		if ( err != 0 )
-			IDMAP_LOG(0, ("libnfsidmap: Nobody-Group (%s) lookup failed due to error(s): %s",
+			// I'm replacing this error message, because:
+			// (1) It is very unlikely that many people encounter this.
+			//         (So there is less chance of scripts scanning for it.)
+			// (2) The `nfsidmap_print_pwgrp_error` function is more careful
+			//         about avoid `malloc` calls, which is important after ENOMEM.
+			//         (So it's more likely to actually work.)
+			// -- Chad Joan  2020-08-12
+			IDMAP_LOG(0, ("libnfsidmap: Nobody-Group: no memory : %s",
 				nobody_group, strerror(errno)));
+		*/
 		else
-		// No errors.
-		{
-			struct group *grp = nfsutil_grp_query_result(&group_query);
-			if (grp != NULL)
-				nobody_gid = grp->gr_gid;
-			else
-				IDMAP_LOG(1, ("libnfsidmap: Nobody-Group (%s) not found.",
-					nobody_group));
-		}
-
-		nfsutil_grp_query_cleanup(&group_query);
+		if ( err == ENOENT )
+			IDMAP_LOG(1, ("libnfsidmap: Nobody-Group (%s) not found.",
+				nobody_group));
+		else
+			nfsidmap_print_pwgrp_error(err, "libnfsidmap",
+				"Nobody-Group", nobody_group, "", "", "");
 	}
 
 	ret = 0;
