@@ -43,6 +43,7 @@
 #include <syslog.h>
 #include "nfsidmap.h"
 #include "nfsidmap_plugin.h"
+#include "passwd_query.h"
 
 #include <voms_apic.h>
 
@@ -465,69 +466,54 @@ out:
 	return ret;
 }
 
-struct pwbuf {
-        struct passwd pwbuf;
-        char buf[1];
-};
-
 static int translate_to_uid(char *local_uid, uid_t *uid, uid_t *gid)
 {
-	int ret = -1;
-	struct passwd *pw = NULL;
-	struct pwbuf *buf = NULL;
-	size_t buflen = sysconf(_SC_GETPW_R_SIZE_MAX);
+	struct nfsutil_passwd_ints  pw_ints;
+	do {
+		pw_ints = nfsutil_getpwnam_ints(local_uid);
+	}
+	while ( pw_ints.err == EINTR );
 
-	buf = malloc(sizeof(*buf) + buflen);
-	if (buf == NULL)
-		goto out;
-
-	ret = getpwnam_r(local_uid, &buf->pwbuf, buf->buf, buflen, &pw);
+	// I am replacing this error message because it gives no indication of
+	// which component/plugin is producing the error:
+	/*
 	if (pw == NULL) {
 		IDMAP_LOG(0, ("getpwnam: name %s not found\n", local_uid));
-		goto out;
+		...
 	}
-	*uid = pw->pw_uid;
-	*gid = pw->pw_gid;
+	*/
+	// -- Chad Joan  2020-08-12
 
-	ret = 0;
-out:
-	if (buf)
-		free(buf);
-	return ret;
+	int err = pw_ints.err;
+	if ( err )
+		nfsidmap_print_pwgrp_error(err, "gums.getpwnam",
+			"name", local_uid, "", "", "");
+	else
+	{
+		// success
+		*uid = pw_ints.uid;
+		*gid = pw_ints.gid;
+	}
+
+	return -err;
 }
 
 static int translate_to_gid(char *local_gid, uid_t *gid)
 {
-	struct group *gr = NULL;
-	struct group grbuf;
-	char *buf = NULL;
-	size_t buflen = sysconf(_SC_GETGR_R_SIZE_MAX);
-	int ret = -1;
-
+	struct nfsutil_group_ints  grp_ints;
 	do {
-		buf = malloc(buflen);
-		if (buf == NULL)
-			goto out;
+		grp_ints = nfsutil_getgrnam_ints(local_gid);
+	}
+	while ( grp_ints.err == EINTR );
 
-		ret = -getgrnam_r(local_gid, &grbuf, buf, buflen, &gr);
-		if (gr == NULL && !ret)
-			ret = -ENOENT;
-		if (ret == -ERANGE) {
-			buflen *= 2;
-			free(buf);
-		}
-	} while (ret == -ERANGE);
+	int err = grp_ints.err;
+	if ( err )
+		nfsidmap_print_pwgrp_error(err, "gums.getgrnam",
+			"group name", local_gid, "", "", "");
+	else // success
+		*gid = grp_ints.gid;
 
-	if (ret)
-		goto out;
-
-	*gid = gr->gr_gid;
-
-	ret = 0;
-out:
-	if (buf)
-		free(buf);
-	return ret;
+	return -err;
 }
 
 static int gums_gss_princ_to_ids(char *secname, char *princ,
