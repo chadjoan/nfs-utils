@@ -50,6 +50,7 @@
 #include "nfsidmap.h"
 #include "nfsidmap_plugin.h"
 #include "nfsidmap_private.h"
+#include "passwd_query.h"
 #include <syslog.h>
 
 static char *get_default_domain(void)
@@ -74,13 +75,13 @@ static int write_name(char *dest, char *localname, char *domain, size_t len,
 {
 	if (doappend || !strchr(localname,'@')) {
 		if (strlen(localname) + 1 + strlen(domain) + 1 > len)
-			return -ENOMEM; /* XXX: Is there an -ETOOLONG? */
+			return ENOMEM; /* XXX: Is there an ETOOLONG? */
 		strcpy(dest, localname);
 		strcat(dest, "@");
 		strcat(dest, domain);
 	} else {
 		if (strlen(localname) + 1 > len)
-			return -ENOMEM;
+			return ENOMEM;
 		strcpy(dest, localname);
 	}
 	return 0;
@@ -88,67 +89,106 @@ static int write_name(char *dest, char *localname, char *domain, size_t len,
 
 static int nss_uid_to_name(uid_t uid, char *domain, char *name, size_t len)
 {
-	struct passwd *pw = NULL;
-	struct passwd pwbuf;
-	char *buf;
-	size_t buflen = sysconf(_SC_GETPW_R_SIZE_MAX);
-	int err = -ENOMEM;
+	char    bufptr[PASSWD_STACKMEM_SIZE_HINT];
+	size_t  buflen = PASSWD_STACKMEM_SIZE_HINT;
+	struct  nfsutil_passwd_query  passwd_query;
+	struct  passwd                *pw = NULL;
 
-	buf = malloc(buflen);
-	if (!buf)
-		goto out;
+	// Slurp up those starter buffers.
+	nfsutil_pw_query_init(&passwd_query, bufptr, buflen);
+
+	// Query the `passwd` database for the user name.
+	int err;
+	do {
+		err = nfsutil_pw_query_call_getpwuid_r(&passwd_query, uid);
+	}
+	while ( err == EINTR );
+	pw = nfsutil_pw_query_result(&passwd_query);
+
+	// Identify ENOENT to make `nfsidmap_print_pwgrp_error` print that outcome
+	// and to ensure that (err == 0) implies (pw != NULL).
+	if ( err == 0 && pw == NULL )
+		err = ENOENT;
+
+	// Ensure that we have SOME domain string.
+	// This will be used for either error printing or for writing our results.
 	if (domain == NULL)
 		domain = get_default_domain();
-	err = -getpwuid_r(uid, &pwbuf, buf, buflen, &pw);
-	if (pw == NULL)
-		err = -ENOENT;
-	if (err)
-		goto out_buf;
-	if (get_nostrip() & IDTYPE_USER)
-		err = write_name(name, pw->pw_name, domain, len, 0);
-	else
-		err = write_name(name, pw->pw_name, domain, len, 1);
-out_buf:
-	free(buf);
-out:
-	return err;
+
+	// Print any errors.
+	if ( err )
+	{
+		char uidstr[24];
+		(void)snprintf(uidstr, 24, "%d", uid);
+		nfsidmap_print_pwgrp_error(err, "nss_uid_to_name",
+			"user with UID", uidstr, " in domain '", domain, "'");
+	}
+	else // (err == 0) -> (pw != NULL)
+	{
+		// success; Write the name found into the caller's buffer.
+		if (get_nostrip() & IDTYPE_USER)
+			err = write_name(name, pw->pw_name, domain, len, 0);
+		else
+			err = write_name(name, pw->pw_name, domain, len, 1);
+	}
+
+	// It is always safe to call the cleanup function as long as we're done
+	// with the query object.
+	nfsutil_pw_query_cleanup(&passwd_query);
+
+	return -err;
 }
 
 static int nss_gid_to_name(gid_t gid, char *domain, char *name, size_t len)
 {
-	struct group *gr = NULL;
-	struct group grbuf;
-	char *buf;
-	size_t buflen = sysconf(_SC_GETGR_R_SIZE_MAX);
-	int err;
+	char    bufptr[GROUP_STACKMEM_SIZE_HINT];
+	size_t  buflen = GROUP_STACKMEM_SIZE_HINT;
+	struct  nfsutil_group_query  group_query;
+	struct  group                *grp = NULL;
 
+	// Slurp up those starter buffers.
+	nfsutil_grp_query_init(&group_query, bufptr, buflen);
+
+	// Query the `group` database for the group name.
+	int err;
+	do {
+		err = nfsutil_grp_query_call_getgrgid_r(&group_query, gid);
+	}
+	while ( err == EINTR );
+	grp = nfsutil_grp_query_result(&group_query);
+
+	// Identify ENOENT to make `nfsidmap_print_pwgrp_error` print that outcome
+	// and to ensure that (err == 0) implies (grp != NULL).
+	if ( err == 0 && grp == NULL )
+		err = ENOENT;
+
+	// Ensure that we have SOME domain string.
+	// This will be used for either error printing or for writing our results.
 	if (domain == NULL)
 		domain = get_default_domain();
 
-	do {
-		err = -ENOMEM;
-		buf = malloc(buflen);
-		if (!buf)
-			goto out;
-		err = -getgrgid_r(gid, &grbuf, buf, buflen, &gr);
-		if (gr == NULL && !err)
-			err = -ENOENT;
-		if (err == -ERANGE) {
-			buflen *= 2;
-			free(buf);
-		}
-	} while (err == -ERANGE);
+	// Print any errors.
+	if ( err )
+	{
+		char gidstr[24];
+		(void)snprintf(gidstr, 24, "%d", gid);
+		nfsidmap_print_pwgrp_error(err, "nss_gid_to_name",
+			"group with GID", gidstr, " in domain '", domain, "'");
+	}
+	else // (err == 0) -> (grp != NULL)
+	{
+		// success; Write the name found into the caller's buffer.
+		if (get_nostrip() & IDTYPE_GROUP)
+			err = write_name(name, grp->gr_name, domain, len, 0);
+		else
+			err = write_name(name, grp->gr_name, domain, len, 1);
+	}
 
-	if (err)
-		goto out_buf;
-	if (get_nostrip() & IDTYPE_GROUP)
-		err = write_name(name, gr->gr_name, domain, len, 0);
-	else
-		err = write_name(name, gr->gr_name, domain, len, 1);
-out_buf:
-	free(buf);
-out:
-	return err;
+	// It is always safe to call the cleanup function as long as we're done
+	// with the query object.
+	nfsutil_grp_query_cleanup(&group_query);
+
+	return -err;
 }
 
 /* XXX: actually should return error, so can distinguish between
@@ -182,87 +222,91 @@ out:
 	return l;
 }
 
-struct pwbuf {
-	struct passwd pwbuf;
-	char buf[1];
-};
-
-static struct passwd *nss_getpwnam(const char *name, const char *domain,
-				   int *err_p, int dostrip)
+static struct nfsutil_passwd_ints
+	nss_getpwnam(const char *name, const char *domain, int dostrip)
 {
-	struct passwd *pw;
-	struct pwbuf *buf;
-	size_t buflen = sysconf(_SC_GETPW_R_SIZE_MAX);
-	char *localname;
-	int err = ENOMEM;
+	struct nfsutil_passwd_ints  pw_ints = nfsutil_passwd_ints_init;
 
-	if (buflen > UINT_MAX)
-		goto err;
-
-	buf = malloc(sizeof(*buf) + buflen);
-	if (buf == NULL)
-		goto err;
-
-	err = EINVAL;
 	if (dostrip) {
-		localname = strip_domain(name, domain);
+		// Attempt domain stripping.
+		char *localname = strip_domain(name, domain);
 		IDMAP_LOG(4, ("nss_getpwnam: name '%s' domain '%s': "
 			  "resulting localname '%s'", name, domain, localname));
 		if (localname == NULL) {
 			IDMAP_LOG(0, ("nss_getpwnam: name '%s' does not map "
 				"into domain '%s'", name,
 				domain ? domain : "<not-provided>"));
-			goto err_free_buf;
+			pw_ints.err = EINVAL;
+			return pw_ints;
 		}
 
-		err = getpwnam_r(localname, &buf->pwbuf, buf->buf, buflen, &pw);
-		if (pw == NULL && domain != NULL)
+		// Do the `getpwnam` lookup to get the uid+gid for this
+		// local user name from the `passwd` database.
+		do {
+			pw_ints = nfsutil_getpwnam_ints(localname);
+		}
+		while ( pw_ints.err == EINTR );
+
+		// Print any error messages.
+		int err = pw_ints.err;
+		if ( err == ENOENT && domain != NULL )
 			IDMAP_LOG(1,
 				("nss_getpwnam: name '%s' not found in domain '%s'",
-				localname, domain));
+					localname, domain));
+		else
+		if ( err && domain != NULL )
+			nfsidmap_print_pwgrp_error(err, "nss_getpwnam",
+				"name", localname, " in domain '", domain, "'");
+		else
+		if ( err )
+			nfsidmap_print_pwgrp_error(err, "nss_getpwnam",
+				"name", localname, "", "", "");
+
+		// Cleanup.
 		free(localname);
 	} else {
-		err = getpwnam_r(name, &buf->pwbuf, buf->buf, buflen, &pw);
-		if (pw == NULL)
+
+		// If there's no stripping to do, we can directly engage in
+		// looking up the uid+gid from the `passwd` database.
+		do {
+			pw_ints = nfsutil_getpwnam_ints(name);
+		}
+		while ( pw_ints.err == EINTR );
+
+		// Print any error messages.
+		int err = pw_ints.err;
+		if ( err == ENOENT )
 			IDMAP_LOG(1,
 				("nss_getpwnam: name '%s' not found (domain not stripped)", name));
-	}
-	if (err == 0 && pw != NULL) {
-		*err_p = 0;
-		return pw;
-	} else if (err == 0 && pw == NULL) {
-		err = ENOENT;
+		else
+			nfsidmap_print_pwgrp_error(err, "nss_getpwnam",
+				"name", name, " (domain not stripped) ", "", "");
 	}
 
-err_free_buf:
-	free(buf);
-err:
-	*err_p = -err;
-	return NULL;
+	return pw_ints;
 }
+
 
 static int nss_name_to_uid(char *name, uid_t *uid)
 {
-	struct passwd *pw = NULL;
-	char *domain;
-	int err = -ENOENT;
+	struct nfsutil_passwd_ints  pw_ints;
 
-	domain = get_default_domain();
+	char *domain = get_default_domain();
 	if (get_nostrip() & IDTYPE_USER) {
-		pw = nss_getpwnam(name, domain, &err, 0);
-		if (pw != NULL)
-			goto out_uid;
+		pw_ints = nss_getpwnam(name, domain, 0);
+		if ( pw_ints.err )
+			pw_ints = nss_getpwnam(name, domain, 1);
 	}
-	pw = nss_getpwnam(name, domain, &err, 1);
-	if (pw == NULL)
-		goto out;
-out_uid:
-	*uid = pw->pw_uid;
+	else
+		pw_ints = nss_getpwnam(name, domain, 1);
+
+	int err = pw_ints.err;
+	if ( err )
+		return -err;
+
+	*uid = pw_ints.uid;
 	IDMAP_LOG(4, ("nss_name_to_uid: name '%s' uid %u", name, *uid));
-	free(pw);
-	err = 0;
-out:
-	return err;
+	return 0;
 }
 
 static char *reformat_name(const char *name)
@@ -296,93 +340,113 @@ out:
 	return l;
 }
 
-static int _nss_name_to_gid(char *name, gid_t *gid, int dostrip)
+static int nss_name_to_gid_inner_02(
+	char *name, gid_t *gid, char **localname, char **ref_name, int dostrip)
 {
-	struct group *gr = NULL;
-	struct group grbuf;
-	char *buf, *domain;
-	size_t buflen = sysconf(_SC_GETGR_R_SIZE_MAX);
-	int err = -EINVAL;
-	char *localname = NULL;
-	char *ref_name = NULL;
-
-	domain = get_default_domain();
+	// Perform any domain stripping or reformatting.
+	char *domain = get_default_domain();
 	if (dostrip) {
-		localname = strip_domain(name, domain);
+		*localname = strip_domain(name, domain);
 		IDMAP_LOG(4, ("nss_name_to_gid: name '%s' domain '%s': "
-			  "resulting localname '%s'", name, domain, localname));
-		if (!localname) {
+			"resulting localname '%s'", name, domain, *localname));
+		if (!*localname) {
 			IDMAP_LOG(0, ("nss_name_to_gid: name '%s' does not map "
-				  "into domain '%s'", name, domain));
-			goto out;
+				"into domain '%s'", name, domain));
+			return -EINVAL;
 		}
 	} else if (get_reformat_group()) {
-		ref_name = reformat_name(name);
-		if (ref_name == NULL) {
+		*ref_name = reformat_name(name);
+		if (*ref_name == NULL) {
 			IDMAP_LOG(1, ("nss_name_to_gid: failed to reformat name '%s'",
-				  name));
-			err = -ENOENT;
-			goto out;
+				name));
+			return -ENOENT;
 		}
 	}
 
-	err = -ENOMEM;
-	if (buflen > UINT_MAX)
-		goto out_name;
+	// The above yielded one of three possible names.
+	// Pick the one that we will use for querying the `group` database.
+	const char *lookup_name;
+	if (dostrip)
+		lookup_name = *localname;
+	else if (get_reformat_group())
+		lookup_name = *ref_name;
+	else
+		lookup_name = name;
 
+	// Query the `group` database to get the group's gid.
+	struct nfsutil_group_ints  grp_ints;
 	do {
-		buf = malloc(buflen);
-		if (!buf)
-			goto out_name;
+		grp_ints = nfsutil_getgrnam_ints(lookup_name);
+	}
+	while ( grp_ints.err == EINTR );
+
+	// Print any error messages.
+	int err = grp_ints.err;
+	if (err == ENOENT) {
+		// These error messages existed before `nfsidmap_print_pwgrp_error`
+		// was written and were left as-is to minimize unnecessary changes.
 		if (dostrip)
-			err = -getgrnam_r(localname, &grbuf, buf, buflen, &gr);
+			IDMAP_LOG(1, ("nss_name_to_gid: name '%s' not found "
+				  "in domain '%s'", *localname, domain));
 		else if (get_reformat_group())
-			err = -getgrnam_r(ref_name, &grbuf, buf, buflen, &gr);
+			IDMAP_LOG(1, ("nss_name_to_gid: name '%s' not found "
+				  "(reformatted)", *ref_name));
 		else
-			err = -getgrnam_r(name, &grbuf, buf, buflen, &gr);
-		if (gr == NULL && !err) {
-			if (dostrip)
-				IDMAP_LOG(1, ("nss_name_to_gid: name '%s' not found "
-					  "in domain '%s'", localname, domain));
-			else if (get_reformat_group())
-				IDMAP_LOG(1, ("nss_name_to_gid: name '%s' not found "
-					  "(reformatted)", ref_name));
-			else
-				IDMAP_LOG(1, ("nss_name_to_gid: name '%s' not found "
-					  "(domain not stripped)", name));
-			err = -ENOENT;
-		}
-		if (err == -ERANGE) {
-			buflen *= 2;
-			free(buf);
-		}
-	} while (err == -ERANGE);
+			IDMAP_LOG(1, ("nss_name_to_gid: name '%s' not found "
+				  "(domain not stripped)", name));
+	}
+	else
+	if ( err ) {
+		// `nfsidmap_print_pwgrp_error` can handle all possible errors that
+		// arise from querying the `group` database, so it will handle
+		// anything that wasn't already checked in this function.
+		if (dostrip)
+			nfsidmap_print_pwgrp_error(err, "nss_name_to_gid",
+				"name", *localname, " in domain '", domain, "'");
+		else if (get_reformat_group())
+			nfsidmap_print_pwgrp_error(err, "nss_name_to_gid",
+				"name", *ref_name, " (reformatted) ", "", "");
+		else
+			nfsidmap_print_pwgrp_error(err, "nss_name_to_gid",
+				"name", name, " (domain not stripped) ", "", "");
+	}
 
 	if (err)
-		goto out_buf;
-	*gid = gr->gr_gid;
+		return -err;
+
+	*gid = grp_ints.gid;
 	IDMAP_LOG(4, ("nss_name_to_gid: name '%s' gid %u", name, *gid));
-out_buf:
-	free(buf);
-out_name:
-	if (dostrip)
-		free(localname);
-	if (get_reformat_group())
+	return 0;
+}
+
+static int nss_name_to_gid_inner_01(char *name, gid_t *gid, int dostrip)
+{
+	// This intermediate function guarantees
+	// that local_name and ref_name are free'd after use.
+	char *local_name = NULL;
+	char *ref_name   = NULL;
+
+	int err = nss_name_to_gid_inner_02(name, gid, &local_name, &ref_name, dostrip);
+
+	if ( local_name )
+		free(local_name);
+	if ( ref_name )
 		free(ref_name);
-out:
+
 	return err;
 }
+
 
 static int nss_name_to_gid(char *name, gid_t *gid)
 {
 	int err = 0;
 
 	if (get_nostrip() & IDTYPE_GROUP) {
-		err = _nss_name_to_gid(name, gid, 0);
+		err = nss_name_to_gid_inner_01(name, gid, 0);
 		if (!err)
 			goto out;
 	}
-	err = _nss_name_to_gid(name, gid, 1);
+	err = nss_name_to_gid_inner_01(name, gid, 1);
 out:
 	return err;
 }
@@ -391,8 +455,6 @@ static int nss_gss_princ_to_ids(char *secname, char *princ,
 				uid_t *uid, uid_t *gid,
 				extra_mapping_params **UNUSED(ex))
 {
-	struct passwd *pw;
-	int err = 0;
 	char *princ_realm;
 	struct conf_list *realms;
 	struct conf_list_node *r;
@@ -425,39 +487,48 @@ static int nss_gss_princ_to_ids(char *secname, char *princ,
 		return -ENOENT;
 	}
 	/* XXX: this should call something like getgssauthnam instead? */
-	pw = nss_getpwnam(princ, NULL, &err, 1);
-	if (pw == NULL) {
-		err = -ENOENT;
-		goto out;
+	struct nfsutil_passwd_ints  pw_ints;
+	pw_ints = nss_getpwnam(princ, NULL, 1);
+
+	if (!pw_ints.err) {
+		*uid = pw_ints.uid;
+		*gid = pw_ints.gid;
 	}
-	*uid = pw->pw_uid;
-	*gid = pw->pw_gid;
-	free(pw);
-out:
-	return err;
+
+	return -pw_ints.err;
 }
 
 static int nss_gss_princ_to_grouplist(char *secname, char *princ,
 			       gid_t *groups, int *ngroups,
 			       extra_mapping_params **UNUSED(ex))
 {
-	struct passwd *pw;
-	int ret = -EINVAL;
-
 	if (strcmp(secname, "krb5") != 0)
-		goto out;
+		return -EINVAL;
 	/* XXX: not quite right?  Need to know default realm? */
 	/* XXX: this should call something like getgssauthnam instead? */
-	pw = nss_getpwnam(princ, NULL, &ret, 1);
-	if (pw == NULL) {
-		ret = -ENOENT;
-		goto out;
+	struct nfsutil_passwd_ints  pw_ints;
+	pw_ints = nss_getpwnam(princ, NULL, 1);
+	int err = pw_ints.err;
+
+	if (err)
+		return -err;
+
+	do {
+		err = nfsutil_getgrouplist_by_uid(
+			pw_ints.uid, pw_ints.gid, groups, ngroups);
 	}
-	if (getgrouplist(pw->pw_name, pw->pw_gid, groups, ngroups) < 0)
-		ret = -ERANGE;
-	free(pw);
-out:
-	return ret;
+	while ( err == EINTR );
+
+	// Note: The caller should handle ERANGE by calling us again
+	//       with a larger `groups` buffer.
+	// `nfsidmap_print_pwgrp_error` might not print the right thing for
+	// ERANGE anyways, because it's meaning here is pretty specific to
+	// getgrouplist's array sizing.
+	if ( err != ERANGE )
+		nfsidmap_print_pwgrp_error(err, "nss_gss_princ_to_grouplist",
+			"user name", princ, "", "", "");
+
+	return -err;
 }
 
 static int nss_plugin_init(void)
